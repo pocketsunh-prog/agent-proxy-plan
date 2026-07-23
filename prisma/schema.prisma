@@ -1,0 +1,110 @@
+// TokenPlan data model — MySQL via Prisma.
+// Replaces the legacy localStorage state and hardcoded data.js/config.js.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+/// Application users. Passwords are bcrypt-hashed (never stored in plaintext).
+model User {
+  id           String     @id @default(cuid())
+  email        String     @unique
+  name         String?
+  passwordHash String
+  role         Role       @default(USER)
+  disabled     Boolean    @default(false)
+  planId       String     @default("free")
+  plan         Plan       @relation(fields: [planId], references: [id])
+  usage        UsageLog[]
+  apiKeys      ApiKey[]
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  @@index([planId])
+}
+
+/// Per-user API keys for programmatic access. Only a SHA-256 hash of the key is
+/// stored; the plaintext (tp_live_…) is shown once at creation and never again.
+model ApiKey {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name       String
+  /// SHA-256 hex digest of the full key — unique so lookups are O(1).
+  keyHash    String    @unique
+  /// Non-secret display prefix, e.g. "tp_live_a1b2c3d4".
+  prefix     String
+  lastUsedAt DateTime?
+  revoked    Boolean   @default(false)
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+}
+
+/// Per-user token usage record. Replaces `state.usage` in the old localStorage.
+model UsageLog {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  modelId      String
+  provider     String
+  displayName  String
+  inputTokens  Int      @default(0)
+  outputTokens Int      @default(0)
+  cost         Decimal  @db.Decimal(18, 8)
+  /// Where the call originated: "web" (chat UI) or "api" (programmatic key).
+  source       String   @default("web")
+  createdAt    DateTime @default(now())
+
+  @@index([userId])
+  @@index([createdAt])
+}
+
+/// Subscription plans. Seeded from the legacy PLANS object in data.js.
+model Plan {
+  id         String  @id
+  name       String
+  monthlyFee Int     @default(0)
+  /// null = unlimited allowance (the old Infinity)
+  allowance  BigInt?
+  overage    Boolean @default(false)
+  features   Json
+  highlight  Boolean @default(false)
+  users      User[]
+}
+
+/// Model catalog + pricing. Seeded from the legacy MODELS object in data.js.
+/// Prices are USD per 1,000,000 tokens.
+model ModelPricing {
+  id            String  @id
+  provider      String
+  displayName   String
+  inputPrice    Decimal @db.Decimal(10, 4)
+  outputPrice   Decimal @db.Decimal(10, 4)
+  contextWindow Int
+  capabilities  Json
+  description    String? @db.Text
+  enabled       Boolean @default(true)
+}
+
+/// Provider connection config. Seeded from the legacy config.js.
+/// apiKey is server-only and never returned unmasked to the browser.
+model ProviderConfig {
+  id           String  @id // deepseek | minimax | longcat
+  displayName  String
+  baseUrl      String
+  apiKey       String  @db.Text
+  /// Path appended to baseUrl for chat completions, e.g. /chat/completions
+  chatPath     String  @default("/chat/completions")
+  enabled      Boolean @default(true)
+}

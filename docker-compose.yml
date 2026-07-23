@@ -1,0 +1,42 @@
+services:
+  db:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-tokenplan}
+      MYSQL_USER: ${MYSQL_USER:-tokenplan}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-tokenplan}
+    ports:
+      - "3306:3306"
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_ROOT_PASSWORD:-rootpassword}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  web:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-mysql://tokenplan:tokenplan@db:3306/tokenplan}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-change-me}
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@tokenplan.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin12345}
+      SEED_DEEPSEEK_API_KEY: ${SEED_DEEPSEEK_API_KEY:-}
+      SEED_DEEPSEEK_BASE_URL: ${SEED_DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}
+      SEED_MINIMAX_API_KEY: ${SEED_MINIMAX_API_KEY:-}
+      SEED_MINIMAX_BASE_URL: ${SEED_MINIMAX_BASE_URL:-https://api.minimax.chat/v1}
+      SEED_LONGCAT_API_KEY: ${SEED_LONGCAT_API_KEY:-}
+      SEED_LONGCAT_BASE_URL: ${SEED_LONGCAT_BASE_URL:-https://api.longcat.chat/openai/v1}
+    ports:
+      - "3000:3000"
+
+volumes:
+  db_data:
