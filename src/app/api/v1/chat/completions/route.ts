@@ -16,7 +16,7 @@ import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { bearerFromHeader, verifyKey } from "@/lib/apikey";
 import { checkAllowance } from "@/lib/usage";
-import { chatComplete } from "@/lib/providers";
+import { chatComplete, chatCompleteStream } from "@/lib/providers";
 
 /**
  * OpenAI-compatible content: either a plain string or an array of content
@@ -107,7 +107,94 @@ export async function POST(req: Request) {
     );
   }
 
-  // ---- Call provider + record usage ----
+  const id = "chatcmpl-" + authed.keyId.slice(0, 12);
+  const created = Math.floor(Date.now() / 1000);
+
+  // ---- Streaming (SSE): pipe deltas live from the upstream provider ----
+  if (stream) {
+    const encoder = new TextEncoder();
+    const generator = chatCompleteStream(modelId, normalized, {
+      temperature,
+      maxTokens: max_tokens,
+    });
+
+    const streamBody = new ReadableStream({
+      async start(controller) {
+        const send = (obj: unknown) => {
+          controller.enqueue(encoder.encode("data: " + JSON.stringify(obj) + "\n\n"));
+        };
+        // Usage is reported by the final `done` chunk; we capture it so we can
+        // persist a UsageLog once the stream has been fully forwarded.
+        let finalUsage: { input: number; output: number; total: number } | null = null;
+        let finalCost = 0;
+        try {
+          for await (const chunk of generator) {
+            if (chunk.type === "delta") {
+              send({
+                id,
+                object: "chat.completion.chunk",
+                created,
+                model: model.id,
+                choices: [
+                  { index: 0, delta: { content: chunk.content }, finish_reason: null },
+                ],
+              });
+            } else {
+              // chunk.type === "done"
+              finalUsage = chunk.usage;
+              finalCost = chunk.cost.totalCost;
+              send({
+                id,
+                object: "chat.completion.chunk",
+                created,
+                model: model.id,
+                choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                usage: {
+                  prompt_tokens: chunk.usage.input,
+                  completion_tokens: chunk.usage.output,
+                  total_tokens: chunk.usage.total,
+                },
+                cost: chunk.cost.totalCost,
+              });
+            }
+          }
+
+          // Stream finished — persist usage.
+          if (finalUsage) {
+            await prisma.usageLog.create({
+              data: {
+                userId: authed.userId,
+                modelId: model.id,
+                provider: model.provider,
+                displayName: model.displayName,
+                inputTokens: finalUsage.input,
+                outputTokens: finalUsage.output,
+                cost: finalCost,
+                source: "api",
+              },
+            });
+          }
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        } catch (err) {
+          // Emit an error event in the stream so the client sees what happened.
+          const message = err instanceof Error ? err.message : "Upstream provider error";
+          send({ error: { message, type: "api_error" } });
+        } finally {
+          controller.close();
+        }
+      },
+    });
+    console.log("[chat/completions] streaming response, id:", id);
+    return new Response(streamBody, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+      },
+    });
+  }
+
+  // ---- Non-streaming ----
   try {
     const result = await chatComplete(modelId, normalized, {
       temperature,
@@ -132,55 +219,6 @@ export async function POST(req: Request) {
       completion_tokens: result.usage.output,
       total_tokens: result.usage.total,
     };
-    const id = "chatcmpl-" + authed.keyId.slice(0, 12);
-    const created = Math.floor(Date.now() / 1000);
-
-    // ---- Streaming (SSE) ----
-    if (stream) {
-      const encoder = new TextEncoder();
-      const streamBody = new ReadableStream({
-        async start(controller) {
-          const send = (obj: unknown) => {
-            controller.enqueue(encoder.encode("data: " + JSON.stringify(obj) + "\n\n"));
-          };
-          // Stream the content in word-sized chunks for a natural feel.
-          const words = result.content.split(/(\s+)/);
-          for (let i = 0; i < words.length; i++) {
-            send({
-              id,
-              object: "chat.completion.chunk",
-              created,
-              model: model.id,
-              choices: [
-                { index: 0, delta: { content: words[i] }, finish_reason: null },
-              ],
-            });
-          }
-          // Final chunk: finish reason + usage + cost.
-          send({
-            id,
-            object: "chat.completion.chunk",
-            created,
-            model: model.id,
-            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-            usage: usageInfo,
-            cost: result.cost.totalCost,
-          });
-          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-          controller.close();
-        },
-      });
-      console.log("[chat/completions] streaming response, id:", id);
-      return new Response(streamBody, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache, no-transform",
-          Connection: "keep-alive",
-        },
-      });
-    }
-
-    // ---- Non-streaming ----
     const responseBody = {
       id,
       object: "chat.completion",
