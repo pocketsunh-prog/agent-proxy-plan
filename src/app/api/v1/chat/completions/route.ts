@@ -16,12 +16,18 @@ import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { bearerFromHeader, verifyKey } from "@/lib/apikey";
 import { checkAllowance } from "@/lib/usage";
-import { chatComplete, chatCompleteStream } from "@/lib/providers";
+import {
+  chatComplete,
+  chatCompleteStream,
+  runToolLoop,
+  type ChatMessage,
+} from "@/lib/providers";
+import { executeTool, MAX_TOOL_ITERATIONS } from "@/lib/tools";
 
 /**
  * OpenAI-compatible content: either a plain string or an array of content
  * blocks (the multimodal format). We accept both, then normalize to a string
- * before calling the provider.
+ * before calling the provider. (Only used for non-tool messages.)
  */
 const contentSchema = z.union([
   z.string(),
@@ -41,13 +47,80 @@ function normalizeContent(content: z.infer<typeof contentSchema>): string {
     .join("\n");
 }
 
+/** An OpenAI function-tool definition. */
+const toolDefinitionSchema = z.object({
+  type: z.literal("function"),
+  function: z.object({
+    name: z.string().min(1),
+    description: z.string().optional(),
+    parameters: z.record(z.unknown()).optional(),
+  }),
+});
+
 const schema = z.object({
   model: z.string().min(1),
-  messages: z.array(z.object({ role: z.enum(["system", "user", "assistant"]), content: contentSchema })).min(1),
+  messages: z
+    .array(
+      z.union([
+        // Tool result messages: carry a tool_call_id instead of free content.
+        z.object({
+          role: z.literal("tool"),
+          tool_call_id: z.string().min(1),
+          content: z.string(),
+          name: z.string().optional(),
+        }),
+        // System / user / assistant messages. An assistant message may also
+        // carry tool_calls (when passing a conversation history back in).
+        z.object({
+          role: z.enum(["system", "user", "assistant"]),
+          content: contentSchema.optional().nullable(),
+          name: z.string().optional(),
+          tool_calls: z
+            .array(
+              z.object({
+                id: z.string(),
+                type: z.literal("function"),
+                function: z.object({
+                  name: z.string(),
+                  arguments: z.string(),
+                }),
+              })
+            )
+            .optional(),
+        }),
+      ])
+    )
+    .min(1),
   temperature: z.number().min(0).max(2).optional(),
   max_tokens: z.number().int().min(1).max(128_000).optional(),
   stream: z.boolean().optional(),
+  tools: z.array(toolDefinitionSchema).optional(),
+  tool_choice: z
+    .union([
+      z.enum(["auto", "none"]),
+      z.object({
+        type: z.literal("function"),
+        function: z.object({ name: z.string() }),
+      }),
+    ])
+    .optional(),
+  parallel_tool_calls: z.boolean().optional(),
 });
+
+/** Convert a validated request message into our internal ChatMessage shape. */
+function toChatMessage(
+  m: z.infer<typeof schema>["messages"][number]
+): ChatMessage {
+  if (m.role === "tool") {
+    return { role: "tool", tool_call_id: m.tool_call_id, content: m.content, name: m.name };
+  }
+  // system / user / assistant: normalize text content (may be null).
+  const normalized = m.content ? normalizeContent(m.content) : null;
+  if (m.role === "assistant" && m.tool_calls) {
+    return { role: "assistant", content: normalized, tool_calls: m.tool_calls };
+  }
+  return { role: m.role, content: normalized };
+}
 
 /** OpenAI-style error envelope. */
 function apiError(message: string, status: number, type = "invalid_request_error") {
@@ -77,13 +150,11 @@ export async function POST(req: Request) {
     console.log("[chat/completions] validation error:", JSON.stringify(parsed.error.errors));
     return apiError(parsed.error.errors[0]?.message || "Invalid request body", 400);
   }
-  const { model: modelId, messages, temperature, max_tokens, stream } = parsed.data;
+  const { model: modelId, messages, temperature, max_tokens, stream, tools } = parsed.data;
 
-  // Normalize multimodal content blocks to plain strings for the provider.
-  const normalized = messages.map((m) => ({
-    role: m.role,
-    content: normalizeContent(m.content),
-  }));
+  // Convert request messages to our internal shape. Tool messages and
+  // assistant tool_calls are preserved; text content is normalized to a string.
+  const normalized = messages.map(toChatMessage);
 
   // ---- Resolve model + plan ----
   const [model, user] = await Promise.all([
@@ -113,10 +184,6 @@ export async function POST(req: Request) {
   // ---- Streaming (SSE): pipe deltas live from the upstream provider ----
   if (stream) {
     const encoder = new TextEncoder();
-    const generator = chatCompleteStream(modelId, normalized, {
-      temperature,
-      maxTokens: max_tokens,
-    });
 
     const streamBody = new ReadableStream({
       async start(controller) {
@@ -127,40 +194,97 @@ export async function POST(req: Request) {
         // persist a UsageLog once the stream has been fully forwarded.
         let finalUsage: { input: number; output: number; total: number } | null = null;
         let finalCost = 0;
+
+        // When tools are present we run a tool loop: stream each turn's text,
+        // execute any tool calls, then continue streaming the next turn.
+        let currentMessages: ChatMessage[] = normalized;
+        const activeTools = tools && tools.length ? tools : undefined;
+
         try {
-          for await (const chunk of generator) {
-            if (chunk.type === "delta") {
-              send({
-                id,
-                object: "chat.completion.chunk",
-                created,
-                model: model.id,
-                choices: [
-                  { index: 0, delta: { content: chunk.content }, finish_reason: null },
-                ],
+          for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
+            let turnToolCalls: ChatMessage["tool_calls"] = [];
+
+            const generator = chatCompleteStream(
+              modelId,
+              currentMessages,
+              { temperature, maxTokens: max_tokens },
+              activeTools
+            );
+
+            for await (const chunk of generator) {
+              if (chunk.type === "delta") {
+                send({
+                  id,
+                  object: "chat.completion.chunk",
+                  created,
+                  model: model.id,
+                  choices: [
+                    { index: 0, delta: { content: chunk.content }, finish_reason: null },
+                  ],
+                });
+              } else if (chunk.type === "tool_calls") {
+                turnToolCalls = turnToolCalls.concat(chunk.toolCalls);
+              } else {
+                // chunk.type === "done"
+                finalUsage = chunk.usage;
+                finalCost = chunk.cost.totalCost;
+              }
+            }
+
+            // No tool calls → this turn produced the final text. Stop looping.
+            if (turnToolCalls.length === 0) break;
+
+            console.log(
+              `[chat/completions] stream tool turn ${iter + 1}: ${turnToolCalls.length} tool(s) —`,
+              turnToolCalls.map((tc) => tc.function.name)
+            );
+
+            // Append the assistant message that requested the tool calls.
+            currentMessages.push({
+              role: "assistant",
+              content: null,
+              tool_calls: turnToolCalls,
+            });
+
+            // Execute each tool call and append its result.
+            for (const tc of turnToolCalls) {
+              let args: Record<string, unknown> = {};
+              try {
+                args = JSON.parse(tc.function.arguments || "{}");
+              } catch {
+                args = {};
+              }
+              const result = await executeTool({
+                id: tc.id,
+                name: tc.function.name,
+                arguments: args,
               });
-            } else {
-              // chunk.type === "done"
-              finalUsage = chunk.usage;
-              finalCost = chunk.cost.totalCost;
-              send({
-                id,
-                object: "chat.completion.chunk",
-                created,
-                model: model.id,
-                choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-                usage: {
-                  prompt_tokens: chunk.usage.input,
-                  completion_tokens: chunk.usage.output,
-                  total_tokens: chunk.usage.total,
-                },
-                cost: chunk.cost.totalCost,
+              currentMessages.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                content: result.content,
+                name: tc.function.name,
               });
             }
           }
 
-          // Stream finished — persist usage.
+          // Emit the final chunk with usage + cost.
           if (finalUsage) {
+            send({
+              id,
+              object: "chat.completion.chunk",
+              created,
+              model: model.id,
+              choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+              usage: {
+                prompt_tokens: finalUsage.input,
+                completion_tokens: finalUsage.output,
+                total_tokens: finalUsage.total,
+              },
+              cost: finalCost,
+            });
+
+            // Persist usage.
             await prisma.usageLog.create({
               data: {
                 userId: authed.userId,
@@ -196,10 +320,10 @@ export async function POST(req: Request) {
 
   // ---- Non-streaming ----
   try {
-    const result = await chatComplete(modelId, normalized, {
-      temperature,
-      maxTokens: max_tokens,
-    });
+    // With tools, run the agentic tool loop; without tools, a single call.
+    const result = tools && tools.length
+      ? await runToolLoop(modelId, normalized, { temperature, maxTokens: max_tokens }, tools)
+      : await chatComplete(modelId, normalized, { temperature, maxTokens: max_tokens });
 
     await prisma.usageLog.create({
       data: {
