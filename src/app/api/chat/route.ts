@@ -12,16 +12,32 @@ import { prisma } from "@/lib/prisma";
 import { getSession } from "@/lib/session";
 import { chatComplete } from "@/lib/providers";
 
+/**
+ * OpenAI-compatible content: either a plain string or an array of content
+ * blocks (the multimodal format). We accept both, then normalize to a string
+ * before calling the provider.
+ */
+const contentSchema = z.union([
+  z.string(),
+  z.array(
+    z.object({
+      type: z.string(),
+      text: z.string().optional(),
+    })
+  ),
+]);
+
+function normalizeContent(content: z.infer<typeof contentSchema>): string {
+  if (typeof content === "string") return content;
+  return content
+    .filter((b) => b.type === "text" && b.text)
+    .map((b) => b.text as string)
+    .join("\n");
+}
+
 const schema = z.object({
   modelId: z.string().min(1),
-  messages: z
-    .array(
-      z.object({
-        role: z.enum(["system", "user", "assistant"]),
-        content: z.string(),
-      })
-    )
-    .min(1),
+  messages: z.array(z.object({ role: z.enum(["system", "user", "assistant"]), content: contentSchema })).min(1),
   temperature: z.number().min(0).max(2).optional(),
   maxTokens: z.number().int().min(1).max(128_000).optional(),
 });
@@ -42,13 +58,19 @@ export async function POST(req: Request) {
 
   const { modelId, messages, temperature, maxTokens } = parsed.data;
 
+  // Normalize multimodal content blocks to plain strings for the provider.
+  const normalized = messages.map((m) => ({
+    role: m.role,
+    content: normalizeContent(m.content),
+  }));
+
   const model = await prisma.modelPricing.findUnique({ where: { id: modelId } });
   if (!model) {
     return NextResponse.json({ error: "Unknown model" }, { status: 404 });
   }
 
   try {
-    const result = await chatComplete(modelId, messages, {
+    const result = await chatComplete(modelId, normalized, {
       temperature,
       maxTokens,
     });

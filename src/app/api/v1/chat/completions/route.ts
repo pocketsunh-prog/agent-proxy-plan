@@ -18,16 +18,32 @@ import { bearerFromHeader, verifyKey } from "@/lib/apikey";
 import { checkAllowance } from "@/lib/usage";
 import { chatComplete } from "@/lib/providers";
 
+/**
+ * OpenAI-compatible content: either a plain string or an array of content
+ * blocks (the multimodal format). We accept both, then normalize to a string
+ * before calling the provider.
+ */
+const contentSchema = z.union([
+  z.string(),
+  z.array(
+    z.object({
+      type: z.string(),
+      text: z.string().optional(),
+    })
+  ),
+]);
+
+function normalizeContent(content: z.infer<typeof contentSchema>): string {
+  if (typeof content === "string") return content;
+  return content
+    .filter((b) => b.type === "text" && b.text)
+    .map((b) => b.text as string)
+    .join("\n");
+}
+
 const schema = z.object({
   model: z.string().min(1),
-  messages: z
-    .array(
-      z.object({
-        role: z.enum(["system", "user", "assistant"]),
-        content: z.string(),
-      })
-    )
-    .min(1),
+  messages: z.array(z.object({ role: z.enum(["system", "user", "assistant"]), content: contentSchema })).min(1),
   temperature: z.number().min(0).max(2).optional(),
   max_tokens: z.number().int().min(1).max(128_000).optional(),
   stream: z.boolean().optional(),
@@ -63,6 +79,12 @@ export async function POST(req: Request) {
   }
   const { model: modelId, messages, temperature, max_tokens, stream } = parsed.data;
 
+  // Normalize multimodal content blocks to plain strings for the provider.
+  const normalized = messages.map((m) => ({
+    role: m.role,
+    content: normalizeContent(m.content),
+  }));
+
   // ---- Resolve model + plan ----
   const [model, user] = await Promise.all([
     prisma.modelPricing.findUnique({ where: { id: modelId } }),
@@ -87,7 +109,7 @@ export async function POST(req: Request) {
 
   // ---- Call provider + record usage ----
   try {
-    const result = await chatComplete(modelId, messages, {
+    const result = await chatComplete(modelId, normalized, {
       temperature,
       maxTokens: max_tokens,
     });
