@@ -4,7 +4,7 @@
   "private": true,
   "description": "TokenPlan — AI usage dashboard with auth and admin (Next.js + MySQL)",
   "scripts": {
-    "dev": "next dev -p 8080",
+    "dev": "next dev -p 8914",
     "build": "prisma generate && next build",
     "start": "next start",
     "lint": "next lint",

@@ -26,7 +26,7 @@ export default function ApiTestClient({ models }: Props) {
   const origin =
     typeof window !== "undefined"
       ? window.location.origin
-      : "http://localhost:8080";
+      : "http://localhost:8914";
   const endpoint = origin + "/api/v1/chat/completions";
 
   const requestBody = useMemo(
