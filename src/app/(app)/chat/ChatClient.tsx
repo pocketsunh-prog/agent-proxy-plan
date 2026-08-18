@@ -149,7 +149,7 @@ export default function ChatClient({ models }: { models: ModelDTO[] }) {
               id="chat-max-tokens"
               type="number"
               min={1}
-              max={8192}
+              max={128_000}
               value={maxTokens}
               onChange={(e) => setMaxTokens(parseInt(e.target.value) || 1024)}
             />

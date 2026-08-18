@@ -29,7 +29,8 @@ const schema = z.object({
     )
     .min(1),
   temperature: z.number().min(0).max(2).optional(),
-  max_tokens: z.number().int().min(1).max(8192).optional(),
+  max_tokens: z.number().int().min(1).max(128_000).optional(),
+  stream: z.boolean().optional(),
 });
 
 /** OpenAI-style error envelope. */
@@ -53,11 +54,14 @@ export async function POST(req: Request) {
   }
 
   // ---- Validate body ----
-  const parsed = schema.safeParse(await req.json().catch(() => null));
+  const rawBody = await req.text().catch(() => "");
+  console.log("[chat/completions] request body:", rawBody);
+  const parsed = schema.safeParse(rawBody ? JSON.parse(rawBody) : null);
   if (!parsed.success) {
+    console.log("[chat/completions] validation error:", JSON.stringify(parsed.error.errors));
     return apiError(parsed.error.errors[0]?.message || "Invalid request body", 400);
   }
-  const { model: modelId, messages, temperature, max_tokens } = parsed.data;
+  const { model: modelId, messages, temperature, max_tokens, stream } = parsed.data;
 
   // ---- Resolve model + plan ----
   const [model, user] = await Promise.all([
@@ -101,11 +105,64 @@ export async function POST(req: Request) {
       },
     });
 
-    // OpenAI-compatible response shape.
-    return NextResponse.json({
-      id: "chatcmpl-" + authed.keyId.slice(0, 12),
+    const usageInfo = {
+      prompt_tokens: result.usage.input,
+      completion_tokens: result.usage.output,
+      total_tokens: result.usage.total,
+    };
+    const id = "chatcmpl-" + authed.keyId.slice(0, 12);
+    const created = Math.floor(Date.now() / 1000);
+
+    // ---- Streaming (SSE) ----
+    if (stream) {
+      const encoder = new TextEncoder();
+      const streamBody = new ReadableStream({
+        async start(controller) {
+          const send = (obj: unknown) => {
+            controller.enqueue(encoder.encode("data: " + JSON.stringify(obj) + "\n\n"));
+          };
+          // Stream the content in word-sized chunks for a natural feel.
+          const words = result.content.split(/(\s+)/);
+          for (let i = 0; i < words.length; i++) {
+            send({
+              id,
+              object: "chat.completion.chunk",
+              created,
+              model: model.id,
+              choices: [
+                { index: 0, delta: { content: words[i] }, finish_reason: null },
+              ],
+            });
+          }
+          // Final chunk: finish reason + usage + cost.
+          send({
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model: model.id,
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+            usage: usageInfo,
+            cost: result.cost.totalCost,
+          });
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+        },
+      });
+      console.log("[chat/completions] streaming response, id:", id);
+      return new Response(streamBody, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache, no-transform",
+          Connection: "keep-alive",
+        },
+      });
+    }
+
+    // ---- Non-streaming ----
+    const responseBody = {
+      id,
       object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
+      created,
       model: model.id,
       choices: [
         {
@@ -114,14 +171,12 @@ export async function POST(req: Request) {
           finish_reason: "stop",
         },
       ],
-      usage: {
-        prompt_tokens: result.usage.input,
-        completion_tokens: result.usage.output,
-        total_tokens: result.usage.total,
-      },
+      usage: usageInfo,
       // Non-standard extra: our computed cost (USD).
       cost: result.cost.totalCost,
-    });
+    };
+    console.log("[chat/completions] response:", JSON.stringify(responseBody));
+    return NextResponse.json(responseBody);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Upstream provider error";
     return apiError(message, 502, "api_error");

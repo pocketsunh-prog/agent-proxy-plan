@@ -68,7 +68,7 @@ export default function ApiKeysClient({
   }
 
   const origin =
-    typeof window !== "undefined" ? window.location.origin : "http://localhost:3000";
+    typeof window !== "undefined" ? window.location.origin : "http://localhost:8080";
 
   return (
     <>

@@ -26,7 +26,7 @@ export default function ApiTestClient({ models }: Props) {
   const origin =
     typeof window !== "undefined"
       ? window.location.origin
-      : "http://localhost:3000";
+      : "http://localhost:8080";
   const endpoint = origin + "/api/v1/chat/completions";
 
   const requestBody = useMemo(
@@ -186,7 +186,7 @@ export default function ApiTestClient({ models }: Props) {
               id="max-tokens"
               type="number"
               min={1}
-              max={8192}
+              max={128_000}
               value={maxTokens}
               onChange={(e) => setMaxTokens(parseInt(e.target.value) || 256)}
             />

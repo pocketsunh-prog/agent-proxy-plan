@@ -65,23 +65,43 @@ export async function chatComplete(
   };
   const url = provider.baseUrl.replace(/\/+$/, "") + provider.chatPath;
   const isMiniMax = provider.id === "minimax";
+  const isAnthropic = provider.id === "anthropic";
 
   const { temperature = 0.7, maxTokens = 1024 } = options;
-  const body: Record<string, unknown> = {
-    model: model.id,
-    messages,
-    temperature,
-  };
-  // MiniMax uses tokens_to_generate; OpenAI-compatible providers use max_tokens.
-  if (isMiniMax) body.tokens_to_generate = maxTokens;
-  else body.max_tokens = maxTokens;
+
+  // Providers speak different wire formats. Build request headers + body per
+  // provider, then parse each response back into our normalized shape.
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  let body: Record<string, unknown>;
+
+  if (isAnthropic) {
+    // Anthropic Messages API: `system` is a top-level field, not a message
+    // role, and auth uses the x-api-key header.
+    const systemMsgs = messages.filter((m) => m.role === "system");
+    const chatMsgs = messages.filter((m) => m.role !== "system");
+    body = {
+      model: model.id,
+      messages: chatMsgs,
+      max_tokens: maxTokens,
+      temperature,
+    };
+    if (systemMsgs.length) {
+      body.system = systemMsgs.map((m) => m.content).join("\n\n");
+    }
+    headers["x-api-key"] = provider.apiKey;
+    headers["anthropic-version"] = "2023-06-01";
+  } else {
+    // OpenAI-compatible (DeepSeek, LongCat, OpenAI, ...) plus MiniMax.
+    body = { model: model.id, messages, temperature };
+    // MiniMax uses tokens_to_generate; OpenAI-compatible providers use max_tokens.
+    if (isMiniMax) body.tokens_to_generate = maxTokens;
+    else body.max_tokens = maxTokens;
+    headers["Authorization"] = "Bearer " + provider.apiKey;
+  }
 
   const res = await fetch(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: "Bearer " + provider.apiKey,
-    },
+    headers,
     body: JSON.stringify(body),
   });
 
@@ -97,7 +117,16 @@ export async function chatComplete(
   let inputTokens: number;
   let outputTokens: number;
 
-  if (isMiniMax) {
+  if (isAnthropic) {
+    // Anthropic: content is an array of blocks; usage.{input,output}_tokens.
+    const blocks = (data.content as Array<{ type: string; text: string }>) ?? [];
+    content = blocks
+      .filter((b) => b.type === "text")
+      .map((b) => b.text)
+      .join("");
+    inputTokens = usage.input_tokens || 0;
+    outputTokens = usage.output_tokens || 0;
+  } else if (isMiniMax) {
     // MiniMax native format: choices[].text, usage.total_tokens.
     content = data.choices?.[0]?.text ?? data.choices?.[0]?.message?.content ?? "";
     const totalTokens = usage.total_tokens || 0;

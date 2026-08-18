@@ -23,7 +23,7 @@ const schema = z.object({
     )
     .min(1),
   temperature: z.number().min(0).max(2).optional(),
-  maxTokens: z.number().int().min(1).max(8192).optional(),
+  maxTokens: z.number().int().min(1).max(128_000).optional(),
 });
 
 export async function POST(req: Request) {

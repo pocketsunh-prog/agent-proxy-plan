@@ -34,7 +34,7 @@ cp .env.example .env          # then edit secrets (see below)
 docker compose up --build
 ```
 
-Open http://localhost:3000. On first boot the `web` container (via
+Open http://localhost:8080. On first boot the `web` container (via
 [`docker-entrypoint.sh`](docker-entrypoint.sh)):
 1. syncs the schema to MySQL (`prisma db push`),
 2. seeds plans, model pricing, providers, and a default admin (idempotent),
@@ -51,7 +51,8 @@ At minimum set:
 - `NEXTAUTH_SECRET` — `openssl rand -base64 32`
 - `ADMIN_EMAIL` / `ADMIN_PASSWORD` — the seeded admin account
 - `SEED_*_API_KEY` — provider keys to seed (optional; you can also add them
-  later in **Admin › Providers**)
+  later in **Admin › Providers**). Supported providers: DeepSeek, MiniMax,
+  LongCat, **OpenAI**, and **Anthropic**.
 
 The default `DATABASE_URL` (`mysql://tokenplan:tokenplan@db:3306/tokenplan`)
 matches the MySQL service in `docker-compose.yml`.
@@ -130,7 +131,7 @@ only a `tp_live_xxxx…` prefix is stored (the full value is SHA-256 hashed). Ca
 the OpenAI-compatible endpoint with the key as a bearer token:
 
 ```bash
-curl http://localhost:3000/api/v1/chat/completions \
+curl http://localhost:8080/api/v1/chat/completions \
   -H "Authorization: Bearer tp_live_YOURKEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -141,7 +142,12 @@ curl http://localhost:3000/api/v1/chat/completions \
 
 Response is a standard `chat.completion` object (`choices`, `usage`) plus a
 non-standard `cost` field (USD). It also works with the OpenAI SDK by pointing
-`base_url` at `http://localhost:3000/api/v1`.
+`base_url` at `http://localhost:8080/api/v1`.
+
+The endpoint is OpenAI-compatible on the way in, but the proxy speaks each
+upstream provider's native format on the way out — so Anthropic's Messages API
+(`/messages`, top-level `system`, `x-api-key` auth) is translated automatically
+for models routed to the `anthropic` provider.
 
 Behavior:
 - **401** — missing / invalid / revoked key.
