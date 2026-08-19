@@ -82,3 +82,20 @@ export function formatUSD(n: number): string {
 export function formatTokens(n: number): string {
   return Math.round(n).toLocaleString("en-US");
 }
+
+/**
+ * Format an ISO date string for display. Pins locale (en-US) and timezone
+ * (UTC) so server and client render identical output — avoiding React
+ * hydration mismatches. `toLocaleString()` with no args uses the runtime's
+ * default locale/tz, which differs between server and browser.
+ */
+export function formatDate(iso: string): string {
+  return new Date(iso).toLocaleString("en-US", {
+    timeZone: "UTC",
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}

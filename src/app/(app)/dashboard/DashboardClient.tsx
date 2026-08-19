@@ -12,7 +12,7 @@ import {
 } from "chart.js";
 import { Doughnut, Bar } from "react-chartjs-2";
 import type { UsageRow } from "@/lib/usage";
-import { formatTokens, formatUSD } from "@/lib/tokenizer";
+import { formatTokens, formatUSD, formatDate } from "@/lib/tokenizer";
 
 ChartJS.register(
   ArcElement,
@@ -184,9 +184,7 @@ export default function DashboardClient({ usage }: { usage: UsageRow[] }) {
               ) : (
                 usage.map((u) => (
                   <tr key={u.id}>
-                    <td className="text-muted">
-                      {new Date(u.time).toLocaleString()}
-                    </td>
+                    <td className="text-muted">{formatDate(u.time)}</td>
                     <td>{u.displayName}</td>
                     <td>{formatTokens(u.input)}</td>
                     <td>{formatTokens(u.output)}</td>
