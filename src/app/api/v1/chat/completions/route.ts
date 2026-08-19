@@ -19,10 +19,8 @@ import { checkAllowance } from "@/lib/usage";
 import {
   chatComplete,
   chatCompleteStream,
-  runToolLoop,
   type ChatMessage,
 } from "@/lib/providers";
-import { executeTool, MAX_TOOL_ITERATIONS } from "@/lib/tools";
 
 /**
  * OpenAI-compatible content: either a plain string or an array of content
@@ -194,79 +192,63 @@ export async function POST(req: Request) {
         // persist a UsageLog once the stream has been fully forwarded.
         let finalUsage: { input: number; output: number; total: number } | null = null;
         let finalCost = 0;
+        let finalStopReason: "stop" | "tool_use" | "length" = "stop";
 
-        // When tools are present we run a tool loop: stream each turn's text,
-        // execute any tool calls, then continue streaming the next turn.
-        let currentMessages: ChatMessage[] = normalized;
+        // The proxy is transparent about tool use: it streams text + tool-call
+        // deltas to the client and lets the client execute the tools. It does
+        // NOT run a server-side tool loop. So a single generator pass covers
+        // the whole turn.
         const activeTools = tools && tools.length ? tools : undefined;
 
         try {
-          for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
-            let turnToolCalls: ChatMessage["tool_calls"] = [];
+          const generator = chatCompleteStream(
+            modelId,
+            normalized,
+            { temperature, maxTokens: max_tokens },
+            activeTools
+          );
 
-            const generator = chatCompleteStream(
-              modelId,
-              currentMessages,
-              { temperature, maxTokens: max_tokens },
-              activeTools
-            );
-
-            for await (const chunk of generator) {
-              if (chunk.type === "delta") {
-                send({
-                  id,
-                  object: "chat.completion.chunk",
-                  created,
-                  model: model.id,
-                  choices: [
-                    { index: 0, delta: { content: chunk.content }, finish_reason: null },
-                  ],
-                });
-              } else if (chunk.type === "tool_calls") {
-                turnToolCalls = turnToolCalls.concat(chunk.toolCalls);
-              } else {
-                // chunk.type === "done"
-                finalUsage = chunk.usage;
-                finalCost = chunk.cost.totalCost;
-              }
-            }
-
-            // No tool calls → this turn produced the final text. Stop looping.
-            if (turnToolCalls.length === 0) break;
-
-            console.log(
-              `[chat/completions] stream tool turn ${iter + 1}: ${turnToolCalls.length} tool(s) —`,
-              turnToolCalls.map((tc) => tc.function.name)
-            );
-
-            // Append the assistant message that requested the tool calls.
-            currentMessages.push({
-              role: "assistant",
-              content: null,
-              tool_calls: turnToolCalls,
-            });
-
-            // Execute each tool call and append its result.
-            for (const tc of turnToolCalls) {
-              let args: Record<string, unknown> = {};
-              try {
-                args = JSON.parse(tc.function.arguments || "{}");
-              } catch {
-                args = {};
-              }
-              const result = await executeTool({
-                id: tc.id,
-                name: tc.function.name,
-                arguments: args,
+          for await (const chunk of generator) {
+            if (chunk.type === "delta") {
+              send({
+                id,
+                object: "chat.completion.chunk",
+                created,
+                model: model.id,
+                choices: [
+                  { index: 0, delta: { content: chunk.content }, finish_reason: null },
+                ],
               });
-              currentMessages.push({
-                role: "tool",
-                tool_call_id: tc.id,
-                content: result.content,
-                name: tc.function.name,
+            } else if (chunk.type === "tool_call_delta") {
+              // Forward the tool-call delta as-is in OpenAI wire format.
+              send({
+                id,
+                object: "chat.completion.chunk",
+                created,
+                model: model.id,
+                choices: [
+                  {
+                    index: 0,
+                    delta: { tool_calls: [chunk.toolCall] },
+                    finish_reason: null,
+                  },
+                ],
               });
+            } else {
+              // chunk.type === "done"
+              finalUsage = chunk.usage;
+              finalCost = chunk.cost.totalCost;
+              finalStopReason = chunk.stopReason;
             }
           }
+
+          // Map our internal stop reason to the OpenAI finish_reason.
+          const finishReason =
+            finalStopReason === "tool_use"
+              ? "tool_calls"
+              : finalStopReason === "length"
+                ? "length"
+                : "stop";
 
           // Emit the final chunk with usage + cost.
           if (finalUsage) {
@@ -275,7 +257,7 @@ export async function POST(req: Request) {
               object: "chat.completion.chunk",
               created,
               model: model.id,
-              choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+              choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
               usage: {
                 prompt_tokens: finalUsage.input,
                 completion_tokens: finalUsage.output,
@@ -320,10 +302,15 @@ export async function POST(req: Request) {
 
   // ---- Non-streaming ----
   try {
-    // With tools, run the agentic tool loop; without tools, a single call.
-    const result = tools && tools.length
-      ? await runToolLoop(modelId, normalized, { temperature, maxTokens: max_tokens }, tools)
-      : await chatComplete(modelId, normalized, { temperature, maxTokens: max_tokens });
+    // The proxy is transparent about tool use: a single provider call, and any
+    // tool calls the model returns are handed to the client to execute. We do
+    // NOT run a server-side tool loop.
+    const result = await chatComplete(
+      modelId,
+      normalized,
+      { temperature, maxTokens: max_tokens },
+      tools && tools.length ? tools : undefined
+    );
 
     await prisma.usageLog.create({
       data: {
@@ -343,18 +330,25 @@ export async function POST(req: Request) {
       completion_tokens: result.usage.output,
       total_tokens: result.usage.total,
     };
+
+    // When the model requests tool calls, return them (in OpenAI wire format)
+    // with finish_reason "tool_calls" instead of a text message.
+    const hasToolCalls = !!result.toolCalls && result.toolCalls.length > 0;
+    const message = hasToolCalls
+      ? { role: "assistant", content: result.content, tool_calls: result.toolCalls }
+      : { role: "assistant", content: result.content };
+    const finishReason = hasToolCalls
+      ? "tool_calls"
+      : result.stopReason === "length"
+        ? "length"
+        : "stop";
+
     const responseBody = {
       id,
       object: "chat.completion",
       created,
       model: model.id,
-      choices: [
-        {
-          index: 0,
-          message: { role: "assistant", content: result.content },
-          finish_reason: "stop",
-        },
-      ],
+      choices: [{ index: 0, message, finish_reason: finishReason }],
       usage: usageInfo,
       // Non-standard extra: our computed cost (USD).
       cost: result.cost.totalCost,

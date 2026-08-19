@@ -12,14 +12,19 @@
  */
 import { prisma } from "@/lib/prisma";
 import { computeCost, estimateTokens, type CostBreakdown } from "@/lib/tokenizer";
-import type { ToolDefinition, ToolCall, ToolResult } from "@/lib/tools";
-import { executeTool } from "@/lib/tools";
+import type { ToolDefinition } from "@/lib/tools";
 
 /**
- * A tool call as the model emits it, in our internal (OpenAI) representation.
- * Re-exported from tools.ts for convenience.
+ * A single streaming tool-call delta in OpenAI wire format. The route forwards
+ * these verbatim into the SSE stream, so the client (not this proxy) executes
+ * the tool and sends the result back as a `role: tool` message.
  */
-export type { ToolCall, ToolResult };
+export interface OpenAIToolCallDelta {
+  index: number;
+  id?: string;
+  type?: "function";
+  function?: { name?: string; arguments?: string };
+}
 
 /**
  * An OpenAI-function tool definition as it arrives in the request body.
@@ -361,13 +366,14 @@ export async function chatComplete(
 /**
  * A chunk emitted by the streaming adapter.
  *   - `delta`: a piece of text as it arrives from the upstream provider.
- *   - `tool_calls`: one or more complete tool calls accumulated during this
- *     turn (emitted once their arguments finish streaming).
+ *   - `tool_call_delta`: one OpenAI-wire-format tool-call delta as it streams
+ *     from the upstream provider. The route forwards these to the client; the
+ *     proxy never executes tool calls itself.
  *   - `done`: final usage + cost + stop reason once the upstream stream ends.
  */
 export type StreamChunk =
   | { type: "delta"; content: string }
-  | { type: "tool_calls"; toolCalls: OpenAIToolCall[] }
+  | { type: "tool_call_delta"; toolCall: OpenAIToolCallDelta }
   | {
       type: "done";
       usage: { input: number; output: number; total: number };
@@ -378,9 +384,14 @@ export type StreamChunk =
 /**
  * Run a streaming chat completion. Returns an async generator that yields text
  * deltas live from the upstream provider's SSE stream, then a final `done`
- * chunk with usage + cost + stop reason. When tools are supplied and the model
- * requests tool calls, a `tool_calls` chunk is emitted once each call's
- * arguments finish streaming. Token usage is recorded by the caller once the
+ * chunk with usage + cost + stop reason.
+ *
+ * When tools are supplied and the model requests tool calls, the proxy does
+ * NOT execute them. Instead it yields a `tool_call_delta` chunk for each
+ * OpenAI-wire-format delta as it streams from the upstream provider (Anthropic
+ * tool_use blocks are translated into this shape). The caller forwards these to
+ * the client, which executes the tool and sends the result back as a
+ * `role: tool` message. Token usage is recorded by the caller once the
  * generator is exhausted.
  */
 export async function* chatCompleteStream(
@@ -414,16 +425,15 @@ export async function* chatCompleteStream(
   let content = "";
   let stopReason: "stop" | "tool_use" | "length" = "stop";
 
-  // --- Tool-call accumulation state ---
-  // Anthropic streams tool_use blocks across multiple SSE events; we accumulate
-  // them here and emit a tool_calls chunk when a block closes.
-  const anthropicToolByIndex: Array<{ id?: string; name?: string; arguments: string }> = [];
-  let currentAnthropicTool: { id: string; name: string; arguments: string } | null = null;
+  // --- Tool-call streaming state ---
+  // Anthropic streams each tool_use block across multiple SSE events. We assign
+  // each block an index (matching its content_block index) so we can emit
+  // OpenAI-wire-format deltas as the block's id/name/arguments arrive.
+  let anthropicToolIndex = 0;
+  let currentAnthropicIndex: number | null = null;
 
-  // OpenAI streams tool_calls deltas (id/name first, then argument fragments);
-  // we accumulate by index and emit when arguments are complete.
-  const openaiToolByIndex: Array<{ id?: string; function?: { name?: string; arguments: string } }> = [];
-  let openaiToolCallsComplete = false;
+  // OpenAI-compatible providers stream tool_call deltas directly; we forward
+  // each delta as-is, so no per-index accumulation is needed there.
 
   // Read the upstream SSE stream event-by-event. Events are separated by a
   // blank line; each may carry one or more `data:` lines.
@@ -459,18 +469,33 @@ export async function* chatCompleteStream(
               case "content_block_start": {
                 const block = parsed.content_block;
                 if (block?.type === "tool_use") {
-                  currentAnthropicTool = {
-                    id: block.id ?? "",
-                    name: block.name ?? "",
-                    arguments: "",
+                  // Start of a new tool_use block. Adopt its index so the
+                  // deltas we emit back the client's tool_call indices.
+                  currentAnthropicIndex = anthropicToolIndex++;
+                  // Emit the id + name delta immediately.
+                  yield {
+                    type: "tool_call_delta",
+                    toolCall: {
+                      index: currentAnthropicIndex,
+                      id: block.id,
+                      type: "function",
+                      function: { name: block.name },
+                    },
                   };
                 }
                 break;
               }
               case "content_block_delta": {
                 // Text delta for a text block, or partial JSON for a tool_use block.
-                if (parsed.delta?.type === "input_json_delta" && currentAnthropicTool) {
-                  currentAnthropicTool.arguments += parsed.partial_json ?? "";
+                if (parsed.delta?.type === "input_json_delta" && currentAnthropicIndex !== null) {
+                  // Stream the next fragment of the tool's input JSON.
+                  yield {
+                    type: "tool_call_delta",
+                    toolCall: {
+                      index: currentAnthropicIndex,
+                      function: { arguments: parsed.partial_json ?? "" },
+                    },
+                  };
                 } else if (parsed.delta?.text) {
                   content += parsed.delta.text;
                   yield { type: "delta", content: parsed.delta.text };
@@ -478,29 +503,8 @@ export async function* chatCompleteStream(
                 break;
               }
               case "content_block_stop": {
-                // A tool_use block just closed — finalize it.
-                if (currentAnthropicTool && currentAnthropicTool.id) {
-                  let input: unknown = {};
-                  try {
-                    input = JSON.parse(currentAnthropicTool.arguments || "{}");
-                  } catch {
-                    input = {};
-                  }
-                  yield {
-                    type: "tool_calls",
-                    toolCalls: [
-                      {
-                        id: currentAnthropicTool.id,
-                        type: "function",
-                        function: {
-                          name: currentAnthropicTool.name,
-                          arguments: JSON.stringify(input),
-                        },
-                      },
-                    ],
-                  };
-                  currentAnthropicTool = null;
-                }
+                // A tool_use block just closed — reset tracking for the next one.
+                currentAnthropicIndex = null;
                 break;
               }
               case "message_delta":
@@ -514,32 +518,26 @@ export async function* chatCompleteStream(
             // choices[].delta.content. Handle both.
             const choice = parsed.choices?.[0];
 
-            // Accumulate streaming tool_call deltas.
-            if (choice?.delta?.tool_calls && !openaiToolCallsComplete) {
+            // Forward each streaming tool_call delta as it arrives. The proxy
+            // never executes these — the client does.
+            if (choice?.delta?.tool_calls) {
               for (const tc of choice.delta.tool_calls) {
-                const idx = tc.index ?? 0;
-                if (!openaiToolByIndex[idx]) {
-                  openaiToolByIndex[idx] = { function: { arguments: "" } };
-                }
-                const entry = openaiToolByIndex[idx];
-                if (tc.id) entry.id = tc.id;
-                if (tc.function?.name) entry.function!.name = tc.function.name;
-                if (tc.function?.arguments) entry.function!.arguments += tc.function.arguments;
+                const fn: { name?: string; arguments?: string } = {};
+                if (tc.function?.name) fn.name = tc.function.name;
+                if (tc.function?.arguments) fn.arguments = tc.function.arguments;
+                yield {
+                  type: "tool_call_delta",
+                  toolCall: {
+                    index: tc.index ?? 0,
+                    id: tc.id,
+                    type: "function",
+                    ...(Object.keys(fn).length ? { function: fn } : {}),
+                  },
+                };
               }
             }
 
-            // Emit accumulated tool calls once the model signals it's done.
             const fr = choice?.finish_reason;
-            if ((fr === "tool_calls" || fr === "stop") && openaiToolByIndex.length && !openaiToolCallsComplete) {
-              const calls = fromOpenAIToolCalls(
-                openaiToolByIndex.map((e) => ({
-                  id: e.id,
-                  function: e.function,
-                }))
-              );
-              if (calls.length) yield { type: "tool_calls", toolCalls: calls };
-              openaiToolCallsComplete = true;
-            }
 
             const text = choice?.delta?.content ?? choice?.text;
             if (text) {
@@ -577,71 +575,4 @@ export async function* chatCompleteStream(
 
   const cost = computeCost(pricing, inputTokens, outputTokens);
   yield { type: "done", usage: { input: inputTokens, output: outputTokens, total }, cost, stopReason };
-}
-
-/**
- * Run a non-streaming chat completion with a tool-use loop. Calls the provider;
- * if the model responds with tool calls, executes them (via the tool registry),
- * appends the assistant + tool-result messages, and re-calls — repeating until
- * the model produces a text response (no tool calls) or `maxIterations` is hit.
- *
- * Returns the final text ChatResult. Intermediate tool executions are logged to
- * the server console for observability.
- */
-export async function runToolLoop(
-  modelId: string,
-  messages: ChatMessage[],
-  options: ChatOptions = {},
-  tools: OpenAIToolDefinition[],
-  maxIterations: number = 10
-): Promise<ChatResult> {
-  let currentMessages: ChatMessage[] = messages.map((m) => ({ ...m }));
-
-  for (let i = 0; i < maxIterations; i++) {
-    const result = await chatComplete(modelId, currentMessages, options, tools);
-
-    // No tool calls → the model is done. Return the final text result.
-    if (!result.toolCalls || result.toolCalls.length === 0) {
-      return result;
-    }
-
-    console.log(
-      `[tool-loop] iteration ${i + 1}/${maxIterations}: model called ${result.toolCalls.length} tool(s):`,
-      result.toolCalls.map((tc) => tc.function.name)
-    );
-
-    // Append the assistant message that requested the tool calls.
-    currentMessages.push({
-      role: "assistant",
-      content: result.content,
-      tool_calls: result.toolCalls,
-    });
-
-    // Execute each tool call and append its result. Run sequentially so output
-    // ordering is deterministic; parallelize later if needed.
-    for (const tc of result.toolCalls) {
-      let args: Record<string, unknown> = {};
-      try {
-        args = JSON.parse(tc.function.arguments || "{}");
-      } catch {
-        args = {};
-      }
-      const toolResult = await executeTool({ id: tc.id, name: tc.function.name, arguments: args });
-      console.log(
-        `[tool-loop]   → ${tc.function.name} (${tc.id}): ${
-          toolResult.is_error ? "ERROR" : "ok"
-        } — ${toolResult.content.length} chars`
-      );
-      currentMessages.push({
-        role: "tool",
-        tool_call_id: tc.id,
-        content: toolResult.content,
-        name: tc.function.name,
-      });
-    }
-  }
-
-  // Guard hit: do one final call without returning more tools the model can use.
-  console.warn(`[tool-loop] reached max iterations (${maxIterations}); forcing final response.`);
-  return chatComplete(modelId, currentMessages, options, tools);
 }
